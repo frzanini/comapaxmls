@@ -1,0 +1,65 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+*.manifest
+*.spec
+
+# --- Virtualenv / Poetry / Pipenv ---
+.venv/
+venv/
+ENV/
+env/
+Pipfile.lock
+poetry.lock
+
+# --- Build / Distribuição ---
+build/
+dist/
+wheels/
+*.whl
+*.egg-info/
+.installed.cfg
+
+# --- Logs / Debug ---
+*.log
+*.pot
+*.mo
+*.cover
+.coverage
+coverage.xml
+htmlcov/
+*.pytest_cache/
+.pytest_cache/
+nosetests.xml
+
+# --- Jupyter / IPython ---
+.ipynb_checkpoints/
+.profile_default/
+.ipython/
+
+# --- Configs locais ---
+.env
+.env.*
+*.ini
+*.toml
+*.cfg
+
+# --- IDEs / Editores ---
+.vscode/
+.idea/
+*.iml
+*.sublime-workspace
+*.sublime-project
+
+# --- Sistemas Operacionais ---
+.DS_Store
+Thumbs.db
+
+temp/*
+!temp/.gitkeep
