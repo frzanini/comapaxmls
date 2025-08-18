@@ -7,7 +7,7 @@ import os
 # Caminho absoluto para o .env na raiz do projeto
 env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
 load_dotenv(dotenv_path=os.path.abspath(env_path))
-api_key = os.getenv("API_KEY")
+api_key = os.getenv("SIEG_API_KEY")
 base_url = os.getenv("URL_BAIXAR_XMLS")
 
 url = f"https://api.sieg.com/api/Certificado/ListarCertificados?active=true&api_key={api_key}"

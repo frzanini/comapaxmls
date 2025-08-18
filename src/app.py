@@ -2,6 +2,7 @@
 from datetime import datetime
 from sieg_client import SiegClient, XmlType
 from s3_uploader import S3Uploader, S3Config
+from dfe_downloader import DFeDownloader
 import os
 from dotenv import load_dotenv
 import logging

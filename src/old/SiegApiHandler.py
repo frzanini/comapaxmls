@@ -47,7 +47,7 @@ class SiegApiHandler:
         env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
         #load_dotenv(dotenv_path=env_path)
 
-        self.api_key = os.getenv("API_KEY")
+        self.api_key = os.getenv("SIEG_API_KEY")
         self.base_url = os.getenv("URL_BAIXAR_XMLS")
 
         if not self.api_key or not self.base_url:

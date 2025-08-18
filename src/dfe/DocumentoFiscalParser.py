@@ -1,915 +1,365 @@
-import xml.etree.ElementTree as ET
+"""
+DocumentoFiscalParser – otimizado p/ AWS Lambda
+- Foco em performance, baixo overhead de logging, e detecção robusta de NFSe (ABRASF variantes)
+- Pode ser usado em execução local ou invocado por Lambda via `lambda_handler`
+
+Requisitos do runtime Lambda: Python 3.11 (boto3 já disponível no ambiente AWS)
+"""
+from __future__ import annotations
+
+import base64
+import json
 import logging
 from datetime import datetime
-from typing import Dict, Optional, Any
-import os
-from pathlib import Path
-from utils.functions import StringUtils
+from functools import lru_cache
+from typing import Any, Dict, Optional
+
+try:
+    # stdlib – mais leve que libs externas
+    import xml.etree.ElementTree as ET
+except Exception as e:  # pragma: no cover
+    raise RuntimeError("xml.etree.ElementTree indisponível") from e
+
+# Boto3 é nativo no runtime AWS Lambda
+try:  # import tardio – só quando necessário (S3)
+    import boto3  # type: ignore
+except Exception:  # pragma: no cover
+    boto3 = None  # evita import se não for usar S3
+
+
+# --------------------------- Logging ---------------------------
+logger = logging.getLogger(__name__)
+# Em Lambda, NÃO chame basicConfig repetidamente. Respeite o handler global.
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+
+
+# --------------------------- Helpers ---------------------------
+@lru_cache(maxsize=64)
+def _ns_uri(local: str) -> str:
+    """URIs oficiais dos DF-e mais frequentes."""
+    mapping = {
+        "nfe": "http://www.portalfiscal.inf.br/nfe",
+        "cte": "http://www.portalfiscal.inf.br/cte",
+        "mdfe": "http://www.portalfiscal.inf.br/mdfe",
+        # NFS-e (múltiplos layouts ABRASF)
+        "nfse1": "http://www.abrasf.org.br/nfse.xsd",
+        "nfse2": "http://nfse.abrasf.org.br",
+        # Assinatura
+        "ds": "http://www.w3.org/2000/09/xmldsig#",
+    }
+    return mapping[local]
+
+
+def _local_name(tag: str) -> str:
+    return tag.split("}")[-1].lower() if "}" in tag else tag.lower()
+
+
+def _text(el: Optional[ET.Element]) -> Optional[str]:
+    return el.text.strip() if el is not None and el.text else None
+
 
 class DocumentoFiscalParser:
-    def __init__(self):
-        self.namespaces = {
-            'nfe': 'http://www.portalfiscal.inf.br/nfe',    # NF-e namespace
-            'nfse': 'http://www.abrasf.org.br/nfse.xsd',    # NFS-e namespace
-            'cte': 'http://www.portalfiscal.inf.br/cte',    # CT-e namespace
-            'mdfe': 'http://www.portalfiscal.inf.br/mdfe',  # MDF-e namespace
-            'ds': 'http://www.w3.org/2000/09/xmldsig#'
-        }
-        self._setup_logging()
+    """Parser performático e tolerante a variações de schema para NFe/CTe/MDFe/NFSe."""
 
-    def _setup_logging(self) -> None:
-        """Configure logging with appropriate format and level."""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
+    # namespaces base (usados como fallback)
+    BASE_NS = {
+        "nfe": _ns_uri("nfe"),
+        "cte": _ns_uri("cte"),
+        "mdfe": _ns_uri("mdfe"),
+        "nfse": _ns_uri("nfse1"),  # default ABRASF
+        "ds": _ns_uri("ds"),
+    }
+
+    # variantes de NFSe (ABRASF) – muitas prefeituras mudam o namespace
+    NFSE_VARIANTS = (
+        _ns_uri("nfse1"),
+        _ns_uri("nfse2"),
+    )
+
+    # --------------------------- API pública ---------------------------
+    def parse_documento_fiscal_string(self, xml_string: str) -> Dict[str, Any]:
+        root = ET.fromstring(xml_string)
+        return self._parse_root(root)
+
+    def parse_documento_fiscal_arquivo(self, path: str, encoding: str = "utf-8") -> Dict[str, Any]:
+        with open(path, "r", encoding=encoding) as f:
+            return self.parse_documento_fiscal_string(f.read())
+
+    # --------------------------- Lambda Handler ---------------------------
+    def lambda_handler(self, event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
+        """Permite invocação direta em Lambda.
+
+        Eventos aceitos:
+        - {"xml": "<xml...>"} (string XML) ou {"xml_base64": "..."}
+        - {"s3_bucket": "...", "s3_key": "..."}
+        Retorna JSON com o dicionário do documento (ou erro).
+        """
+        try:
+            if "xml" in event:
+                xml_str = event["xml"]
+            elif "xml_base64" in event:
+                xml_str = base64.b64decode(event["xml_base64"]).decode("utf-8", "ignore")
+            elif "s3_bucket" in event and "s3_key" in event:
+                if boto3 is None:
+                    raise RuntimeError("boto3 não disponível no ambiente")
+                s3 = boto3.client("s3")
+                obj = s3.get_object(Bucket=event["s3_bucket"], Key=event["s3_key"])  # type: ignore
+                body = obj["Body"].read()
+                xml_str = body.decode("utf-8", "ignore")
+            else:
+                return {"erro": "Evento inválido. Informe 'xml'|'xml_base64' ou 's3_bucket'+'s3_key'"}
+
+            result = self.parse_documento_fiscal_string(xml_str)
+            return result
+        except Exception as e:  # log enxuto
+            logger.exception("Falha no lambda_handler")
+            return {"erro": str(e)}
+
+
+    # --------------------------- Núcleo ---------------------------
+    def _parse_root(self, root: ET.Element) -> Dict[str, Any]:
+        tag = _local_name(root.tag)
+
+        # Normalização: algumas vezes o root é *proc*, noutras a própria nota
+        # Mapeia tags finais para tipos
+        tipo_mapping = {
+            "nfeproc": "NF-e",
+            "nfe": "NF-e",
+            "cteproc": "CT-e",
+            "cte": "CT-e",
+            "mdfeproc": "MDF-e",
+            "mdfe": "MDF-e",
+            "comppnfse": "NFS-e",  # variações comuns (ex.: CompNfse/CompNFSe)
+            "compnfse": "NFS-e",
+            "nfse": "NFS-e",
+            "proceventonfe": "Evento",
+            "proceventocte": "Evento",
+            "proceventomdfe": "Evento",
+            "eventoproc": "Evento",
+            "evento": "Evento",
+        }
+        tipo = tipo_mapping.get(tag)
+
+        # Descoberta de namespaces do documento (mais barato que tentar nsmap)
+        ns_candidates = self._collect_namespaces(root)
+
+        if tipo == "NF-e":
+            return self._parse_nfe_like(root, "nfe", ns_candidates, tipo)
+        if tipo == "CT-e":
+            return self._parse_nfe_like(root, "cte", ns_candidates, tipo)
+        if tipo == "MDF-e":
+            return self._parse_nfe_like(root, "mdfe", ns_candidates, tipo)
+        if tipo == "Evento":
+            return self._parse_evento(root, ns_candidates)
+
+        # Tentativa: NFSe (muitos layouts têm root "CompNfse"/"Nfse")
+        if tipo == "NFS-e" or self._looks_like_nfse(root, ns_candidates):
+            return self._parse_nfse(root, ns_candidates)
+
+        return {"erro": f"Tipo de documento não identificado (tag='{tag}')"}
+
+    # --------------------------- Parsers ---------------------------
+    def _parse_nfe_like(self, root: ET.Element, ns_key: str, ns_candidates: Dict[str, str], tipo: str) -> Dict[str, Any]:
+        ns = {ns_key: ns_candidates.get(ns_key, self.BASE_NS[ns_key])}
+        # inf tag: infNFe / infCte / infMDFe
+        inf_tag = {
+            "nfe": "infNFe",
+            "cte": "infCte",
+            "mdfe": "infMDFe",
+        }[ns_key]
+
+        ide_tag = "ide"
+
+        inf = root.find(f".//{ns_key}:{inf_tag}", ns)
+        chave = None
+        if inf is not None:
+            _id = inf.attrib.get("Id")
+            if _id:
+                # remove prefixo NFe/CTe/MDFe
+                chave = _id.replace("NFe", "").replace("CTe", "").replace("MDFe", "")
+
+        emit_cnpj = _text(root.find(f".//{ns_key}:emit/{ns_key}:CNPJ", ns))
+        emit_cpf = _text(root.find(f".//{ns_key}:emit/{ns_key}:CPF", ns))
+
+        # destinatário (para MDF-e pode não existir – mantemos None)
+        dest = _text(root.find(f".//{ns_key}:dest/{ns_key}:CNPJ", ns)) or _text(
+            root.find(f".//{ns_key}:dest/{ns_key}:CPF", ns)
         )
 
-    def ler_arquivo_xml(self, caminho_arquivo: str) -> Optional[str]:
-            """
-            Lê um arquivo XML e retorna seu conteúdo como string.
-            
-            Args:
-                caminho_arquivo: Caminho para o arquivo XML
-                
-            Returns:
-                Optional[str]: Conteúdo do arquivo XML ou None em caso de erro
-                
-            Raises:
-                FileNotFoundError: Se o arquivo não for encontrado
-                PermissionError: Se não houver permissão para ler o arquivo
-                UnicodeDecodeError: Se houver erro na decodificação do arquivo
-            """
-            try:
-                # Normaliza o caminho do arquivo
-                caminho = Path(caminho_arquivo).resolve()
-                
-                # Verifica se o arquivo existe
-                if not caminho.exists():
-                    raise FileNotFoundError(f"Arquivo não encontrado: {caminho}")
-                
-                # Verifica se é um arquivo
-                if not caminho.is_file():
-                    raise ValueError(f"O caminho especificado não é um arquivo: {caminho}")
-                
-                # Verifica se tem extensão .xml
-                if caminho.suffix.lower() != '.xml':
-                    raise ValueError(f"O arquivo não tem extensão .xml: {caminho}")
-                
-                # Verifica o tamanho do arquivo (evita arquivos muito grandes)
-                tamanho_max = 10 * 1024 * 1024  # 10MB
-                if caminho.stat().st_size > tamanho_max:
-                    raise ValueError(f"Arquivo muito grande. Tamanho máximo permitido: {tamanho_max/1024/1024}MB")
-                
-                # Tenta ler o arquivo com diferentes encodings
-                encodings = ['utf-8', 'utf-8-sig', 'latin1', 'iso-8859-1']
-                
-                for encoding in encodings:
-                    try:
-                        with open(caminho, 'r', encoding=encoding) as file:
-                            conteudo = file.read()
-                            logging.info(f"Arquivo XML lido com sucesso usando encoding {encoding}")
-                            return conteudo
-                    except UnicodeDecodeError:
-                        continue
-                
-                raise UnicodeDecodeError(
-                    "Não foi possível decodificar o arquivo com nenhum dos encodings suportados"
-                )
-                
-            except FileNotFoundError as e:
-                logging.error(f"Arquivo não encontrado: {e}")
-                raise
-            except PermissionError as e:
-                logging.error(f"Erro de permissão ao ler o arquivo: {e}")
-                raise
-            except UnicodeDecodeError as e:
-                logging.error(f"Erro ao decodificar o arquivo: {e}")
-                raise
-            except Exception as e:
-                logging.exception(f"Erro inesperado ao ler o arquivo XML: {e}")
-                raise
+        # data emissão – alguns XMLs antigos usam dEmi (sem hora)
+        dh_emi = _text(root.find(f".//{ns_key}:{ide_tag}/{ns_key}:dhEmi", ns)) or _text(
+            root.find(f".//{ns_key}:{ide_tag}/{ns_key}:dEmi", ns)
+        )
 
-    def parse_documento_fiscal_arquivo(self, caminho_arquivo: str) -> Dict[str, Any]:
-        """
-        Parse um documento fiscal a partir de um arquivo XML.
-        
-        Args:
-            caminho_arquivo: Caminho para o arquivo XML
-            
-        Returns:
-            Dict[str, Any]: Dicionário com os dados do documento fiscal ou erro
-        """
-        logging.info(f"Iniciando o parse do arquivo: {caminho_arquivo}")
-        try:
-            xml_string = self.ler_arquivo_xml(caminho_arquivo)
-            if xml_string:
-                return self.parse_documento_fiscal_string(xml_string)
-            else:
-                return {'erro': 'Não foi possível ler o conteúdo do arquivo XML'}
-                
-        except FileNotFoundError:
-            return {'erro': f'Arquivo não encontrado: {caminho_arquivo}'}
-        except PermissionError:
-            return {'erro': f'Sem permissão para ler o arquivo: {caminho_arquivo}'}
-        except UnicodeDecodeError:
-            return {'erro': 'Erro ao decodificar o arquivo. Encoding não suportado.'}
-        except Exception as e:
-            logging.exception(f"Erro ao processar o arquivo: {caminho_arquivo}")
-            return {'erro': f'Erro ao processar o arquivo: {str(e)}'}
-
-    def parse_documento_fiscal_string(self, xml_string: str) -> Dict[str, Any]:
-        """Parse a fiscal document from an XML string."""
-        logging.info("Iniciando o parse de um documento fiscal a partir de uma string.")
-        try:
-            root = self._parse_xml(xml_string)
-            tipo_documento = self._identificar_tipo_documento(root)
-            
-            processors = {
-                'NF-e': self.parse_nfe,
-                'CT-e': self.parse_cte,  # Similar structure to NF-e
-                'MDF-e': self.parse_mdfe, # Similar structure to NF-e
-                'NFS-e': self.parse_nfse,
-                'Evento': self._processar_evento,
-                'procEventoNFe': self._processar_proc_evento,
-                'procEventoCTe': self._processar_proc_eventoCTeMDFe,
-                'procEventoMDFe': self._processar_proc_eventoCTeMDFe
-            }
-            
-            processor = processors.get(tipo_documento)
-            if processor:
-                logging.info(f"Documento identificado como {tipo_documento}.")
-                return processor(root, tipo_documento)
-            else:
-                logging.warning("Tipo de documento fiscal não identificado.")
-                return {'erro': 'Tipo de documento fiscal não identificado'}
-
-        except ET.ParseError as e:
-            logging.error(f"Erro ao interpretar o XML: {str(e)}")
-            return {'erro': 'Conteúdo fornecido não é um XML válido'}
-        except Exception as e:
-            logging.exception("Erro inesperado durante o parse do documento fiscal.")
-            return {'erro': f'Erro inesperado: {str(e)}'}
-
-    def _parse_xml(self, xml_string: str) -> ET.Element:
-        """Parse XML string into ElementTree."""
-        logging.debug("Interpretando o XML fornecido.")
-
-        #xml_str = StringUtils.remover_caracteres(xml_string,'<','>')
-
-        return ET.fromstring(xml_string)
-
-    def _identificar_tipo_documento(self, root: ET.Element) -> Optional[str]:
-        """Identify the type of fiscal document."""
-        logging.debug("Identificando o tipo de documento fiscal.")
-        tag = root.tag.lower()
-        
-        tipo_mapping = {
-            'proceventonfe': 'procEventoNFe',
-            'proceventocte': 'procEventoCTe',
-            'proceventomdfe': 'procEventoMDFe',
-            'eventoproc': 'Evento',
-            'evento': 'Evento',
-            'cteproc': 'CT-e',
-            'cte': 'CT-e',
-            'mdfeproc': 'MDF-e',
-            'mdfe': 'MDF-e',
-            'compnfse': 'NFS-e',
-            'nfse': 'NFS-e',
-            'nfeproc': 'NF-e',
-            'nfe': 'NF-e'
+        # protocolo (quando proc*)
+        prot_paths = {
+            "nfe": ".//nfe:protNFe/nfe:infProt/nfe:nProt",
+            "cte": ".//cte:protCTe/cte:infProt/cte:nProt",
+            "mdfe": ".//mdfe:protMDFe/mdfe:infProt/mdfe:nProt",
         }
-        
-        for suffix, doc_type in tipo_mapping.items():
-            if tag.endswith(suffix):
-                return doc_type
-                
-        logging.warning(f"Tipo de documento não identificado para a tag: {tag}")
-        return None
+        prot_ns = {
+            "nfe": {"nfe": ns["nfe"]},
+            "cte": {"cte": ns.get("cte", self.BASE_NS["cte"])},
+            "mdfe": {"mdfe": ns.get("mdfe", self.BASE_NS["mdfe"])},
+        }
+        protocolo = _text(root.find(prot_paths[ns_key], prot_ns[ns_key]))
 
-        def _processar_nfe(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-            """Process NF-e, CT-e, or MDF-e documents."""
-            logging.debug(f"Processando {tipo_documento}.")
-            try:
-                # Define namespace based on document type
-                if tipo_documento == 'NF-e':
-                    ns = 'nfe'
-                    uri = 'http://www.portalfiscal.inf.br/nfe'
-                elif tipo_documento == 'CT-e':
-                    ns = 'cte'
-                    uri = 'http://www.portalfiscal.inf.br/cte'
-                elif tipo_documento == 'MDF-e':
-                    ns = 'mdfe'
-                    uri = 'http://www.portalfiscal.inf.br/mdfe'
-                else:
-                    raise ValueError("Tipo de documento inválido")
-
-                # Namespace mapping
-                namespaces = {ns: uri}
-
-                # Extract emitter CNPJ
-                cnpj_emitente = root.find(f'.//{ns}:emit/{ns}:CNPJ', namespaces)
-                if cnpj_emitente is None:
-                    raise ValueError(f"CNPJ do emitente não encontrado no {tipo_documento}")
-
-                # Extract recipient identification
-                destinatario = self._extrair_destinatario(root, ns)
-                if destinatario is None:
-                    raise ValueError(f"Destinatário não encontrado no {tipo_documento}")
-
-                # Extract access key and emission date
-                info_tag = f'inf{tipo_documento.replace("-", "")}'
-                info_element = root.find(f'.//{ns}:{info_tag}', namespaces)
-                if info_element is None or 'Id' not in info_element.attrib:
-                    raise ValueError(f"Chave de acesso não encontrada no {tipo_documento}")
-                
-                chave_acesso = info_element.get('Id').replace(tipo_documento.replace("-", ""), '')
-
-                data_emissao = root.find(f'.//{ns}:ide/{ns}:dhEmi', namespaces)
-                if data_emissao is None:
-                    raise ValueError(f"Data de emissão não encontrada no {tipo_documento}")
-
-                return self._formatar_saida(tipo_documento, cnpj_emitente.text, destinatario, chave_acesso, data_emissao.text)
-
-            except AttributeError as e:
-                logging.error(f"Erro ao processar {tipo_documento}: Estrutura inválida - {str(e)}")
-                return {'erro': f'Estrutura do {tipo_documento} inválida'}
-            except ValueError as e:
-                logging.error(f"Erro ao processar {tipo_documento}: {str(e)}")
-                return {'erro': str(e)}
-            except Exception as e:
-                logging.exception(f"Erro inesperado ao processar {tipo_documento}")
-                return {'erro': f'Erro inesperado ao processar {tipo_documento}: {str(e)}'}
-
-    def parse_cte(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-        """
-        Faz o parse do XML de CT-e e devolve os dados em um dicionário.
-        :param xml_path: Caminho do arquivo XML.
-        :return: Dicionário com os dados do CT-e.
-        """
-        try:
-            # Namespaces do XML
-            namespaces = {'cte': 'http://www.portalfiscal.inf.br/cte'}
-
-            # Carregar o XML
-            #tree = ET.parse(xml_path)
-            #root = tree.getroot()
-
-            # Definir tipo de documento
-            #tipo_documento = "CT-e"
-
-            # Extrair chave de acesso
-            inf_cte = root.find('.//cte:infCte', namespaces)
-            chave_acesso = inf_cte.attrib['Id'].replace("CTe", "") if inf_cte is not None else None
-
-            # Extrair CNPJ do emitente
-            cnpj_emitente = root.find('.//cte:emit/cte:CNPJ', namespaces)
-            cnpj_emitente_text = cnpj_emitente.text if cnpj_emitente is not None else None
-
-            cpf_emitente = root.find('.//cte:emit/cte:CPF', namespaces)
-            cpf_emitente_text = cpf_emitente.text if cpf_emitente is not None else None
-
-            # Extrair CNPJ do destinatário
-            destinatario = root.find('.//cte:dest/cte:CNPJ', namespaces)
-            destinatario_text = destinatario.text if destinatario is not None else None
-
-            # Extrair data de emissão
-            data_emissao = root.find('.//cte:ide/cte:dhEmi', namespaces)
-            data_emissao_text = data_emissao.text if data_emissao is not None else None
-
-            # Formatando data de emissão (opcional)
-            data_emissao_formatada = data_emissao_text.split('T')[0] if data_emissao_text else None
-
-            # Extrair protocolo, se existir
-            protocolo = root.find('.//cte:protCTe/cte:infProt/cte:nProt', namespaces)
-            protocolo_text = protocolo.text if protocolo is not None else None
-
-            # Montar o dicionário de saída
-            resultado = {
-                'tipo_documento': tipo_documento,
-                'chave_acesso': chave_acesso,
-                'cnpj_emitente': cnpj_emitente_text,
-                'cpf_emitente': cpf_emitente_text,
-                'destinatario': destinatario_text,
-                'data_emissao': data_emissao_formatada,
-                'protocolo': protocolo_text
-            }
-
-            logging.info("XML processado com sucesso.")
-            return resultado
-
-        except ET.ParseError as e:
-            logging.error(f"Erro ao parsear o XML: {e}")
-            return {'erro': 'Falha ao processar o XML'}
-        except Exception as e:
-            logging.exception(f"Erro inesperado: {e}")
-            return {'erro': f'Erro inesperado: {str(e)}'}
-
-    def parse_mdfe(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-        """
-        Faz o parse do XML de MDF-e e devolve os dados em um dicionário.
-        :param xml_path: Caminho do arquivo XML.
-        :return: Dicionário com os dados do MDF-e.
-        """
-        try:
-            # Namespaces do XML
-            namespaces = {'mdfe': 'http://www.portalfiscal.inf.br/mdfe'}
-
-            # Carregar o XML
-            #tree = ET.parse(xml_path)
-            #root = tree.getroot()
-
-            # Definir tipo de documento
-            #tipo_documento = "MDF-e"
-
-            # Extrair chave de acesso
-            inf_mdfe = root.find('.//mdfe:infMDFe', namespaces)
-            chave_acesso = inf_mdfe.attrib['Id'].replace("MDFe", "") if inf_mdfe is not None else None
-
-            # Extrair CNPJ do emitente
-            cnpj_emitente = root.find('.//mdfe:emit/mdfe:CNPJ', namespaces)
-            cnpj_emitente_text = cnpj_emitente.text if cnpj_emitente is not None else None
-
-            cpf_emitente = root.find('.//mdfe:emit/mdfe:CPF', namespaces)
-            cpf_emitente_text = cpf_emitente.text if cpf_emitente is not None else None
-
-            # Extrair destinatário (remetente ou contratante, conforme MDF-e não tem destinatário direto)
-            contratante = root.find('.//mdfe:infModal/mdfe:rodo/mdfe:infANTT/mdfe:RNTRC', namespaces)
-            destinatario_text = contratante.text if contratante is not None else "Não especificado"
-
-            # Extrair data de emissão
-            data_emissao = root.find('.//mdfe:ide/mdfe:dhEmi', namespaces)
-            data_emissao_text = data_emissao.text if data_emissao is not None else None
-
-            # Formatando data de emissão (opcional)
-            data_emissao_formatada = data_emissao_text.split('T')[0] if data_emissao_text else None
-
-            # Extrair protocolo, se existir
-            protocolo = root.find('.//mdfe:protMDFe/mdfe:infProt/mdfe:nProt', namespaces)
-            protocolo_text = protocolo.text if protocolo is not None else None
-
-            # Montar o dicionário de saída
-            resultado = {
-                'tipo_documento': tipo_documento,
-                'chave_acesso': chave_acesso,
-                'cnpj_emitente': cnpj_emitente_text,
-                'cpf_emitente': cpf_emitente_text,
-                'destinatario': destinatario_text,
-                'data_emissao': data_emissao_formatada,
-                'protocolo': protocolo_text
-            }
-
-            logging.info("XML MDF-e processado com sucesso.")
-            return resultado
-
-        except ET.ParseError as e:
-            logging.error(f"Erro ao parsear o XML: {e}")
-            return {'erro': 'Falha ao processar o XML'}
-        except Exception as e:
-            logging.exception(f"Erro inesperado: {e}")
-            return {'erro': f'Erro inesperado: {str(e)}'}
-
-    def parse_nfe(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-        """
-        Faz o parse do XML de NF-e e devolve os dados em um dicionário.
-        :param xml_path: Caminho do arquivo XML.
-        :return: Dicionário com os dados da NF-e.
-        """
-        try:
-            # Namespaces do XML da NF-e
-            namespaces = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-
-            # Carregar o XML
-            #tree = ET.parse(xml_path)
-            #root = tree.getroot()
-
-            # Definir tipo de documento
-            #tipo_documento = "NF-e"
-
-            # Extrair chave de acesso
-            inf_nfe = root.find('.//nfe:infNFe', namespaces)
-            chave_acesso = inf_nfe.attrib['Id'].replace("NFe", "") if inf_nfe is not None else None
-
-            # Extrair CNPJ do emitente
-            cnpj_emitente = root.find('.//nfe:emit/nfe:CNPJ', namespaces)
-            cnpj_emitente_text = cnpj_emitente.text if cnpj_emitente is not None else None
-
-            cpf_emitente = root.find('.//nfe:emit/nfe:CPF', namespaces)
-            cpf_emitente_text = cpf_emitente.text if cpf_emitente is not None else None
-
-            # Extrair CNPJ do destinatário
-            cnpj_destinatario = root.find('.//nfe:dest/nfe:CNPJ', namespaces)
-            cpf_destinatario = root.find('.//nfe:dest/nfe:CPF', namespaces)
-            destinatario_text = cnpj_destinatario.text if cnpj_destinatario is not None else (
-                cpf_destinatario.text if cpf_destinatario is not None else "Não especificado"
-            )
-
-            # Extrair data de emissão
-            data_emissao = root.find('.//nfe:ide/nfe:dhEmi', namespaces)
-            if data_emissao is None:
-                # Em versões antigas da NF-e, use 'dEmi' como fallback
-                data_emissao = root.find('.//nfe:ide/nfe:dEmi', namespaces)
-            data_emissao_text = data_emissao.text if data_emissao is not None else None
-
-            # Formatando data de emissão (opcional)
-            data_emissao_formatada = data_emissao_text.split('T')[0] if data_emissao_text and 'T' in data_emissao_text else data_emissao_text
-
-            # Extrair protocolo, se existir
-            protocolo = root.find('.//nfe:protNFe/nfe:infProt/nfe:nProt', namespaces)
-            protocolo_text = protocolo.text if protocolo is not None else None
-
-            # Montar o dicionário de saída
-            resultado = {
-                'tipo_documento': tipo_documento,
-                'chave_acesso': chave_acesso,
-                'cnpj_emitente': cnpj_emitente_text,
-                'cpf_emitente': cpf_emitente_text,
-                'destinatario': destinatario_text,
-                'data_emissao': data_emissao_formatada,
-                'protocolo': protocolo_text
-            }
-
-            logging.info("XML NF-e processado com sucesso.")
-            return resultado
-
-        except ET.ParseError as e:
-            logging.error(f"Erro ao parsear o XML: {e}")
-            return {'erro': 'Falha ao processar o XML'}
-        except Exception as e:
-            logging.exception(f"Erro inesperado: {e}")
-            return {'erro': f'Erro inesperado: {str(e)}'}
-
-    def parse_evento_nfe(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-        """
-        Faz o parse do XML de eventos da NF-e e devolve os dados em um dicionário.
-        :param xml_path: Caminho do arquivo XML.
-        :return: Dicionário com os dados do evento da NF-e.
-        """
-        try:
-            # Namespaces do XML de eventos da NF-e
-            namespaces = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-
-            # Carregar o XML
-            #tree = ET.parse(xml_path)
-            #root = tree.getroot()
-
-            # Definir tipo de documento
-            #tipo_documento = "Evento NF-e"
-
-            # Extrair chave de acesso
-            chave_acesso = root.find('.//nfe:chNFe', namespaces)
-            chave_acesso_text = chave_acesso.text if chave_acesso is not None else None
-
-            # Extrair tipo de evento
-            tp_evento = root.find('.//nfe:detEvento/nfe:descEvento', namespaces)
-            tipo_evento_text = tp_evento.text if tp_evento is not None else "Não especificado"
-
-            # Extrair protocolo do evento
-            protocolo = root.find('.//nfe:infEvento/nfe:nProt', namespaces)
-            protocolo_text = protocolo.text if protocolo is not None else None
-
-            # Extrair data/hora do evento
-            dh_evento = root.find('.//nfe:infEvento/nfe:dhEvento', namespaces)
-            data_evento_text = dh_evento.text if dh_evento is not None else None
-
-            # Extrair CNPJ do emitente
-            cnpj_emitente = root.find('.//nfe:infEvento/nfe:CNPJ', namespaces)
-            cnpj_emitente_text = cnpj_emitente.text if cnpj_emitente is not None else None
-            
-            cpf_emitente = root.find('.//nfe:infEvento/nfe:CPF', namespaces)
-            cpf_emitente_text = cpf_emitente.text if cpf_emitente is not None else None
-
-            # Montar o dicionário de saída
-            resultado = {
-                'tipo_documento': tipo_documento,
-                'chave_acesso': chave_acesso_text,
-                'tipo_evento': tipo_evento_text,
-                'cnpj_emitente': cnpj_emitente_text,
-                'cpf_emitente': cpf_emitente_text,
-                'data_evento': data_evento_text,
-                'protocolo': protocolo_text
-            }
-
-            logging.info("XML de evento NF-e processado com sucesso.")
-            return resultado
-
-        except ET.ParseError as e:
-            logging.error(f"Erro ao parsear o XML: {e}")
-            return {'erro': 'Falha ao processar o XML'}
-        except Exception as e:
-            logging.exception(f"Erro inesperado: {e}")
-            return {'erro': f'Erro inesperado: {str(e)}'}
-
-    def parse_nfse(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-        """
-        Faz o parse do XML de NFS-e e devolve os dados em um dicionário.
-        :param xml_path: Caminho do arquivo XML.
-        :return: Dicionário com os dados da NFS-e.
-        """
-        try:
-            # Namespaces do XML (adaptado para NFS-e)
-            namespaces = {
-                'nfse': 'http://www.abrasf.org.br/nfse.xsd'  # Namespace padrão de NFS-e (ajuste conforme necessário)
-            }
-
-            # Carregar o XML
-            #tree = ET.parse(xml_path)
-            #root = tree.getroot()
-
-            # Definir tipo de documento
-            #tipo_documento = "NFS-e"
-
-            # Extrair chave de acesso (identificador da NFS-e)
-            inf_nfse = root.find('.//nfse:InfNfse', namespaces)
-            chave_acesso = inf_nfse.find('.//nfse:Numero', namespaces).text if inf_nfse is not None else None
-
-            # Extrair CNPJ do prestador
-            cnpj_prestador = root.find('.//nfse:PrestadorServico/nfse:IdentificacaoPrestador/nfse:Cnpj', namespaces)
-            cnpj_prestador_text = cnpj_prestador.text if cnpj_prestador is not None else None
-
-            # Extrair CNPJ do tomador (destinatário)
-            cnpj_tomador = root.find('.//nfse:TomadorServico/nfse:IdentificacaoTomador/nfse:CpfCnpj/nfse:Cnpj', namespaces)
-            cnpj_tomador_text = cnpj_tomador.text if cnpj_tomador is not None else None
-
-            # Extrair data de emissão
-            data_emissao = root.find('.//nfse:InfNfse/nfse:DataEmissao', namespaces)
-            data_emissao_text = data_emissao.text if data_emissao is not None else None
-
-            # Formatando data de emissão (opcional)
-            data_emissao_formatada = data_emissao_text.split('T')[0] if data_emissao_text else None
-
-            # Extrair protocolo (número da NFS-e)
-            numero_nfse = root.find('.//nfse:InfNfse/nfse:Numero', namespaces)
-            protocolo_text = numero_nfse.text if numero_nfse is not None else None
-
-            # Montar o dicionário de saída
-            resultado = {
-                'tipo_documento': tipo_documento,
-                'chave_acesso': chave_acesso,
-                'cnpj_emitente': cnpj_prestador_text,
-                'destinatario': cnpj_tomador_text,
-                'data_emissao': data_emissao_formatada,
-                'protocolo': protocolo_text
-            }
-
-            logging.info("XML NFS-e processado com sucesso.")
-            return resultado
-
-        except ET.ParseError as e:
-            logging.error(f"Erro ao parsear o XML: {e}")
-            return {'erro': 'Falha ao processar o XML'}
-        except Exception as e:
-            logging.exception(f"Erro inesperado: {e}")
-            return {'erro': f'Erro inesperado: {str(e)}'}
-
-    def _processar_nfe(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-        """Process NF-e, CT-e, or MDF-e documents."""
-        logging.debug(f"Processando {tipo_documento}.")
-        try:
-            # Define namespace based on document type
-            if tipo_documento == 'NF-e':
-                ns = 'nfe'
-                uri = 'http://www.portalfiscal.inf.br/nfe'
-            elif tipo_documento == 'CT-e':
-                ns = 'cte'
-                uri = 'http://www.portalfiscal.inf.br/cte'
-            elif tipo_documento == 'MDF-e':
-                ns = 'mdfe'
-                uri = 'http://www.portalfiscal.inf.br/mdfe'
-            else:
-                raise ValueError("Tipo de documento inválido")
-
-            # Namespace mapping
-            namespaces = {ns: uri}
-
-            # Extract emitter CNPJ
-            cnpj_emitente = root.find(f'.//{ns}:emit/{ns}:CNPJ', namespaces)
-            if cnpj_emitente is None:
-                raise ValueError(f"CNPJ do emitente não encontrado no {tipo_documento}")
-
-            # Extract recipient identification
-            destinatario = self._extrair_destinatario(root, ns)
-            if destinatario is None:
-                raise ValueError(f"Destinatário não encontrado no {tipo_documento}")
-
-            # Extract access key and emission date
-            info_tag = f'inf{tipo_documento.replace("-", "")}'
-            info_element = root.find(f'.//{ns}:{info_tag}', namespaces)
-            if info_element is None or 'Id' not in info_element.attrib:
-                raise ValueError(f"Chave de acesso não encontrada no {tipo_documento}")
-            
-            chave_acesso = info_element.get('Id').replace(tipo_documento.replace("-", ""), '')
-
-            data_emissao = root.find(f'.//{ns}:ide/{ns}:dhEmi', namespaces)
-            if data_emissao is None:
-                raise ValueError(f"Data de emissão não encontrada no {tipo_documento}")
-
-            # Extract total value and ICMS values
-            valor_total_nota = root.find(f'.//{ns}:total/{ns}:ICMSTot/{ns}:vNF', namespaces)
-            if valor_total_nota is None:
-                raise ValueError(f"Valor total da nota não encontrado no {tipo_documento}")
-
-            valor_total_icms = root.find(f'.//{ns}:total/{ns}:ICMSTot/{ns}:vICMS', namespaces)
-            if valor_total_icms is None:
-                raise ValueError(f"Valor total de ICMS não encontrado no {tipo_documento}")
-
-
-            return self._formatar_saida(tipo_documento, cnpj_emitente.text, destinatario, chave_acesso, data_emissao.text)
-
-        except AttributeError as e:
-            logging.error(f"Erro ao processar {tipo_documento}: Estrutura inválida - {str(e)}")
-            return {'erro': f'Estrutura do {tipo_documento} inválida'}
-        except ValueError as e:
-            logging.error(f"Erro ao processar {tipo_documento}: {str(e)}")
-            return {'erro': str(e)}
-        except Exception as e:
-            logging.exception(f"Erro inesperado ao processar {tipo_documento}")
-            return {'erro': f'Erro inesperado ao processar {tipo_documento}: {str(e)}'}
-
-    def _processar_nfe1(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-        """Process NF-e, CT-e, or MDF-e documents."""
-        logging.debug(f"Processando {tipo_documento}.")
-        try:
-            # Define namespace based on document type
-            ns = 'nfe' if tipo_documento == 'NF-e' else ('cte' if tipo_documento == 'CT-e' else 'mdfe')
-            
-            # Extract emitter CNPJ
-            cnpj_emitente = root.find(f'.//{ns}:emit/{ns}:CNPJ', self.namespaces)
-            if cnpj_emitente is None:
-                raise ValueError(f"CNPJ do emitente não encontrado no {tipo_documento}")
-
-            # Extract recipient identification
-            destinatario = self._extrair_destinatario(root, ns)
-            if destinatario is None:
-                raise ValueError(f"Destinatário não encontrado no {tipo_documento}")
-
-            # Extract access key and emission date
-            info_tag = f'inf{tipo_documento.replace("-", "")}'
-            chave_acesso = root.find(f'.//{ns}:{info_tag}', self.namespaces).get('Id').replace(tipo_documento.replace("-", ""), '')
-            data_emissao = root.find(f'.//{ns}:ide/{ns}:dhEmi', self.namespaces).text
-
-            return self._formatar_saida(tipo_documento, cnpj_emitente.text, destinatario, chave_acesso, data_emissao)
-
-        except AttributeError as e:
-            logging.error(f"Erro ao processar {tipo_documento}: Estrutura inválida - {str(e)}")
-            return {'erro': f'Estrutura do {tipo_documento} inválida'}
-        except ValueError as e:
-            logging.error(f"Erro ao processar {tipo_documento}: {str(e)}")
-            return {'erro': str(e)}
-        except Exception as e:
-            logging.exception(f"Erro inesperado ao processar {tipo_documento}")
-            return {'erro': f'Erro inesperado ao processar {tipo_documento}: {str(e)}'}
-
-    def _processar_nfse(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-        """Process NFS-e documents."""
-        logging.debug("Processando NFS-e.")
-        try:
-            # Extract emitter CNPJ
-            cnpj_emitente = root.find('.//nfse:Prestador/nfse:Cnpj', self.namespaces)
-            if cnpj_emitente is None:
-                raise ValueError("CNPJ do prestador não encontrado na NFS-e")
-
-            # Extract recipient identification
-            tomador_cnpj = root.find('.//nfse:Tomador/nfse:IdentificacaoTomador/nfse:Cnpj', self.namespaces)
-            tomador_cpf = root.find('.//nfse:Tomador/nfse:IdentificacaoTomador/nfse:Cpf', self.namespaces)
-            
-            destinatario = tomador_cnpj.text if tomador_cnpj is not None else (
-                tomador_cpf.text if tomador_cpf is not None else None
-            )
-
-            if destinatario is None:
-                raise ValueError("Tomador não possui CNPJ ou CPF válido")
-
-            # Extract service number and emission date
-            numero_nfse = root.find('.//nfse:IdentificacaoNfse/nfse:Numero', self.namespaces)
-            if numero_nfse is None:
-                raise ValueError("Número da NFS-e não encontrado")
-
-            data_emissao = root.find('.//nfse:DataEmissao', self.namespaces)
-            if data_emissao is None:
-                raise ValueError("Data de emissão não encontrada na NFS-e")
-
-            return self._formatar_saida('NFS-e', cnpj_emitente.text, destinatario, 
-                                      numero_nfse.text, data_emissao.text)
-
-        except AttributeError as e:
-            logging.error(f"Erro ao processar NFS-e: Estrutura inválida - {str(e)}")
-            return {'erro': 'Estrutura da NFS-e inválida'}
-        except ValueError as e:
-            logging.error(f"Erro ao processar NFS-e: {str(e)}")
-            return {'erro': str(e)}
-        except Exception as e:
-            logging.exception("Erro inesperado ao processar NFS-e")
-            return {'erro': f'Erro inesperado ao processar NFS-e: {str(e)}'}
-
-    def _processar_evento(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-        """Process event documents."""
-        logging.debug("Processando evento.")
-        try:
-            ns = 'nfe'  # Default namespace
-            
-            # Extract required information
-            chave_acesso = root.find(f'.//{ns}:chNFe', self.namespaces)
-            tipo_evento = root.find(f'.//{ns}:tpEvento', self.namespaces)
-            descricao_evento = root.find(f'.//{ns}:xEvento', self.namespaces)
-            data_evento = root.find(f'.//{ns}:dhEvento', self.namespaces)
-            cnpj_emitente = root.find(f'.//{ns}:CNPJ', self.namespaces) #(f'.//{ns}:CNPJ', 'text'),
-            cpf_emitente = root.find(f'.//{ns}:CPF', self.namespaces) #(f'.//{ns}:CPF', 'text'),
-
-            if None in [chave_acesso, tipo_evento, descricao_evento, data_evento]:
-                raise ValueError("Informações obrigatórias do evento não encontradas")
-
-            return {
-                'tipo_documento': 'Evento',
-                'isevent' :'1',
-                'chave_acesso': chave_acesso.text,
-                'cnpj_emitente': cnpj_emitente,
-                'cpf_emitente': cpf_emitente,
-                'tipo_evento': tipo_evento.text,
-                'descricao_evento': descricao_evento.text,
-                'data_evento': datetime.fromisoformat(data_evento.text).strftime('%Y-%m-%d %H:%M:%S')
-            }
-
-        except AttributeError as e:
-            logging.error(f"Erro ao processar evento: Estrutura inválida - {str(e)}")
-            return {'erro': 'Estrutura do evento inválida'}
-        except ValueError as e:
-            logging.error(f"Erro ao processar evento: {str(e)}")
-            return {'erro': str(e)}
-        except Exception as e:
-            logging.exception("Erro inesperado ao processar evento")
-            return {'erro': f'Erro inesperado ao processar evento: {str(e)}'}
-
-    def _processar_proc_evento(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-        """Process procEvento documents for any DFe type."""
-        logging.debug("Processando procEvento.")
-        try:
-            # Determine the namespace based on the root tag
-            ns_map = {
-                'proceventonfe': 'nfe',
-                'proceventocte': 'cte',
-                'proceventomdfe': 'mdfe'
-            }
-
-            ns_lookup = root.tag.lower().split('}')[-1]
-            ns = ns_map.get(ns_lookup, None)
-
-            # If namespace not found, try to find the most specific namespace in the root element
-            if ns is None:
-                for ns_prefix, ns_uri in root.nsmap.items():
-                    if ns_uri in self.namespaces.values():
-                        ns = ns_prefix
-                        break
-
-            # Extract event information
-            evento = root.find(f'.//{ns}:evento', self.namespaces)
-            if evento is None:
-                evento = root.find(f'.//{ns}:eventocte', self.namespaces)
-                if evento is None:
-                    evento = root.find(f'.//{ns}:eventomdf', self.namespaces)
-                    if evento is None:
-                        raise ValueError("Evento não encontrado no procEvento")
-
-            infEvento = evento.find(f'.//{ns}:infEvento', self.namespaces)
-            if infEvento is None:
-                raise ValueError("infEvento não encontrado no procEvento")
-
-            # Extract required fields
-            campos = {
-                'chave_acesso': (f'.//{ns}:chNFe', 'text'),
-                'tipo_evento': (f'.//{ns}:tpEvento', 'text'),
-                'sequencia_evento': (f'.//{ns}:nSeqEvento', 'text'),
-                'cnpj_emitente': (f'.//{ns}:CNPJ', 'text'),
-                'cpf_emitente': (f'.//{ns}:CPF', 'text'),
-                'data_evento': (f'.//{ns}:dhEvento', 'text'),
-                'descricao_evento': (f'.//{ns}:xEvento', 'text'),
-                'protocolo': (f'.//{ns}:nProt', 'text')
-            }
-
-            resultado = {'tipo_documento': tipo_documento}
-            resultado['isevent'] = '1'
-            
-            for campo, (xpath, attr_type) in campos.items():
-                elemento = infEvento.find(xpath, self.namespaces)
-                if elemento is not None:
-                    valor = getattr(elemento, attr_type)
-                    if campo == 'data_evento':
-                        valor = datetime.fromisoformat(valor).strftime('%Y-%m-%d %H:%M:%S')
-                    resultado[campo] = valor
-
-            # Add processing status
-            retEvento = root.find(f'.//{ns}:retEvento', self.namespaces)
-            if retEvento is not None:
-                resultado['status_processamento'] = retEvento.find(f'.//{ns}:cStat', self.namespaces).text
-                resultado['motivo'] = retEvento.find(f'.//{ns}:xMotivo', self.namespaces).text
-
-            # Indica se o documento é um EVENTO (NFE/CTE/MDFE/)
-            resultado['isevent'] = '1'
-
-            return resultado
-
-        except ValueError as e:
-            logging.error(f"Erro ao processar procEvento: {str(e)}")
-            return {'erro': str(e)}
-        except Exception as e:
-            logging.exception("Erro inesperado ao processar procEvento")
-            return {'erro': f'Erro inesperado ao processar procEvento: {str(e)}'}
-
-    def _processar_proc_eventoCTeMDFe(self, root: ET.Element, tipo_documento: str) -> Dict[str, Any]:
-        """
-        Processa os eventos de CTe e MDFe
-        Args:
-            xml_string: String contendo o XML do evento
-        Returns:
-            Dictionary com as informações processadas ou None em caso de erro
-        """
-        try:
-            # Parse do XML
-            #root = ET.fromstring(xml_string)
-            
-            # Determinar o tipo de documento baseado no namespace
-            root_tag = root.tag.split('}')[1] if '}' in root.tag else root.tag
-            namespace = None
-            
-            if 'procEventoCTe' in root_tag:
-                namespace = self.namespaces['cte']
-            elif 'procEventoMDFe' in root_tag:
-                namespace = self.namespaces['mdfe']
-            else:
-                raise ValueError(f"Tipo de documento não suportado: {root_tag}")
-
-            # Criar namespace map para as buscas
-            nsmap = {'ns': namespace}
-
-            # Extrair informações do evento
-            info_evento = root.find('.//ns:infEvento', nsmap)
-            if info_evento is None:
-                raise ValueError("infEvento não encontrado no XML")
-
-            # Extrair informações do evento detalhado
-            det_evento = info_evento.find('.//ns:detEvento', nsmap)
-            if det_evento is None:
-                raise ValueError("detEvento não encontrado no XML")
-
-            # Extrair informações do retorno
-            ret_evento = root.find('.//ns:retEventoCTe', nsmap) if 'cte' in namespace else root.find('.//ns:retEventoMDFe', nsmap)
-            if ret_evento is None:
-                raise ValueError("retEvento não encontrado no XML")
-
-            # Montar dicionário com as informações
-            resultado = {
-                'tipo_documento': 'CTE' if 'cte' in namespace else 'MDFE',
-                'chave_acesso': info_evento.findtext('ns:chCTe', namespaces=nsmap) or info_evento.findtext('ns:chMDFe', namespaces=nsmap),
-                'tipo_evento': info_evento.findtext('ns:tpEvento', namespaces=nsmap),
-                'sequencia_evento': info_evento.findtext('ns:nSeqEvento', namespaces=nsmap),
-                'cnpj_emitente': info_evento.findtext('ns:CNPJ', namespaces=nsmap),
-                'cpf_emitente': info_evento.findtext('ns:CPF', namespaces=nsmap),
-                'data_evento': info_evento.findtext('ns:dhEvento', namespaces=nsmap),
-                'status': ret_evento.findtext('.//ns:cStat', namespaces=nsmap),
-                'motivo': ret_evento.findtext('.//ns:xMotivo', namespaces=nsmap),
-                'protocolo': ret_evento.findtext('.//ns:nProt', namespaces=nsmap),
-                'data_registro': ret_evento.findtext('.//ns:dhRegEvento', namespaces=nsmap)
-            }
-
-            # Processar informações específicas do detEvento
-            if det_evento is not None:
-                # Para eventos de MDFe autorizado em CTe
-                mdfe_info = det_evento.find('.//ns:MDFe', nsmap)
-                if mdfe_info is not None:
-                    resultado['mdfe'] = {
-                        'chave_acesso': mdfe_info.findtext('ns:chMDFe', namespaces=nsmap),
-                        'protocolo': mdfe_info.findtext('ns:nProt', namespaces=nsmap),
-                        'data_recebimento': mdfe_info.findtext('ns:dhRecbto', namespaces=nsmap)
-                    }
-
-            resultado['isevent'] = '1'
-
-            return resultado
-
-        except ET.ParseError as e:
-            logging.error(f"Erro ao fazer parse do XML: {e}")
-            return None
-        except Exception as e:
-            logging.error(f"Erro ao processar evento: {e}")
-            return None
-
-    def _extrair_destinatario(self, root: ET.Element, ns: str) -> Optional[str]:
-        """Extract recipient identification (CNPJ or CPF) from document."""
-        dest_path = f'.//{ns}:dest'
-        destinatario = root.find(f'{dest_path}/{ns}:CNPJ', self.namespaces)
-        if destinatario is None:
-            destinatario = root.find(f'{dest_path}/{ns}:CPF', self.namespaces)
-        return destinatario.text if destinatario is not None else None
-
-    
-    def _formatar_saida(self, tipo_documento, cnpj_emitente, destinatario, chave_acesso, data_emissao):
-        logging.debug("Formatando a saída do documento fiscal.")
-        data_emissao_formatada = datetime.fromisoformat(data_emissao).strftime('%Y-%m-%d %H:%M:%S')
         return {
-            'tipo_documento': tipo_documento,
-            'cnpj_emitente': cnpj_emitente,
-            'destinatario': destinatario,
-            'chave_acesso': chave_acesso,
-            'data_emissao': data_emissao_formatada
+            "tipo_documento": tipo,
+            "chave_acesso": chave,
+            "cnpj_emitente": emit_cnpj,
+            "cpf_emitente": emit_cpf,
+            "destinatario": dest,
+            "data_emissao": self._normalize_datetime(dh_emi),
+            "protocolo": protocolo,
         }
-    # [Previous methods remain unchanged: parse_documento_fiscal_arquivo, _parse_xml, 
-    # _processar_nfse, _processar_evento, _formatar_saida]
+
+    def _parse_evento(self, root: ET.Element, ns_candidates: Dict[str, str]) -> Dict[str, Any]:
+        ns = {"nfe": ns_candidates.get("nfe", self.BASE_NS["nfe"])}
+        ch = _text(root.find(".//nfe:chNFe", ns))
+        tp = _text(root.find(".//nfe:tpEvento", ns)) or _text(root.find(".//nfe:detEvento/nfe:descEvento", ns))
+        seq = _text(root.find(".//nfe:nSeqEvento", ns))
+        cnpj = _text(root.find(".//nfe:CNPJ", ns))
+        cpf = _text(root.find(".//nfe:CPF", ns))
+        dh = _text(root.find(".//nfe:dhEvento", ns))
+        prot = _text(root.find(".//nfe:nProt", ns))
+        return {
+            "tipo_documento": "Evento",
+            "isevent": "1",
+            "chave_acesso": ch,
+            "tipo_evento": tp,
+            "sequencia_evento": seq,
+            "cnpj_emitente": cnpj,
+            "cpf_emitente": cpf,
+            "data_evento": self._normalize_datetime(dh),
+            "protocolo": prot,
+        }
+
+    def _parse_nfse(self, root: ET.Element, ns_candidates: Dict[str, str]) -> Dict[str, Any]:
+        """Parser tolerante a variações ABRASF (CompNfse/Nfse, caminhos e namespaces)."""
+        # escolha do namespace – tenta candidatos do documento, depois variantes conhecidas
+        nfse_ns_uri = ns_candidates.get("nfse")
+        if nfse_ns_uri is None or nfse_ns_uri not in self.NFSE_VARIANTS:
+            # força uma variante conhecida para xpath
+            nfse_ns_uri = self.NFSE_VARIANTS[0]
+        ns = {"nfse": nfse_ns_uri}
+
+        # Correções: tags podem vir com capitalização/mudanças leves (Numero vs número etc.)
+        # Estruturas mais frequentes:
+        #   CompNfse/Nfse/InfNfse
+        #   Nfse/InfNfse
+        # Numero pode estar em InfNfse/Numero ou IdentificacaoNfse/Numero
+        # PrestadorServico/IdentificacaoPrestador/(Cnpj|CpfCnpj/Cnpj|CpfCnpj/Cpf)
+        # TomadorServico/IdentificacaoTomador/(Cnpj|CpfCnpj/Cnpj|CpfCnpj/Cpf)
+
+        # Achar nó base InfNfse
+        inf = (
+            root.find(".//nfse:InfNfse", ns)
+            or root.find(".//nfse:InfNFSe", ns)
+            or root.find(".//nfse:infNfse", ns)
+        )
+
+        # Numero (chave da NFSe)
+        numero = _text(root.find(".//nfse:IdentificacaoNfse/nfse:Numero", ns))
+        if not numero and inf is not None:
+            numero = _text(inf.find("nfse:Numero", ns))
+
+        # Data de emissão
+        data_emissao = _text(root.find(".//nfse:DataEmissao", ns))
+        if not data_emissao and inf is not None:
+            data_emissao = _text(inf.find("nfse:DataEmissao", ns))
+
+        # Prestador (emitente)
+        emit = (
+            _text(root.find(".//nfse:PrestadorServico/nfse:IdentificacaoPrestador/nfse:Cnpj", ns))
+            or _text(root.find(".//nfse:PrestadorServico/nfse:IdentificacaoPrestador/nfse:CpfCnpj/nfse:Cnpj", ns))
+            or _text(root.find(".//nfse:PrestadorServico/nfse:IdentificacaoPrestador/nfse:CpfCnpj/nfse:Cpf", ns))
+        )
+
+        # Tomador (destinatário)
+        dest = (
+            _text(root.find(".//nfse:TomadorServico/nfse:IdentificacaoTomador/nfse:Cnpj", ns))
+            or _text(root.find(".//nfse:TomadorServico/nfse:IdentificacaoTomador/nfse:Cpf", ns))
+            or _text(root.find(".//nfse:TomadorServico/nfse:IdentificacaoTomador/nfse:CpfCnpj/nfse:Cnpj", ns))
+            or _text(root.find(".//nfse:TomadorServico/nfse:IdentificacaoTomador/nfse:CpfCnpj/nfse:Cpf", ns))
+        )
+
+        return {
+            "tipo_documento": "NFS-e",
+            "chave_acesso": numero,
+            "cnpj_emitente": emit,
+            "destinatario": dest,
+            "data_emissao": self._normalize_datetime(data_emissao),
+            "protocolo": numero,  # muitas prefeituras usam o mesmo número como protocolo
+        }
+
+    # --------------------------- Utilidades ---------------------------
+    def _looks_like_nfse(self, root: ET.Element, ns_candidates: Dict[str, str]) -> bool:
+        tag = _local_name(root.tag)
+        if tag in {"compnfse", "comppnfse", "nfse"}:
+            return True
+        # Heurística: se há DataEmissao + PrestadorServico no doc
+        ns = {"nfse": ns_candidates.get("nfse", self.BASE_NS["nfse"]) }
+        has_nfse_signals = bool(
+            root.find(".//nfse:PrestadorServico", ns) is not None
+            or root.find(".//nfse:TomadorServico", ns) is not None
+            or root.find(".//nfse:InfNfse", ns) is not None
+        )
+        return has_nfse_signals
+
+    def _normalize_datetime(self, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        try:
+            # aceita "YYYY-MM-DD" ou ISO completo
+            if "T" in value:
+                # remove timezone se presente (ElementTree não converte TZ)
+                try:
+                    # 2025-08-14T02:23:33-03:00 -> 2025-08-14 02:23:33
+                    return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                except Exception:
+                    pass
+            # fallback: só data
+            return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            # se formato muito irregular, devolve como veio
+            return value
+
+    def _collect_namespaces(self, root: ET.Element) -> Dict[str, str]:
+        # Não há nsmap no ElementTree puro; deduz da própria árvore via atributos xmlns
+        ns = dict(self.BASE_NS)
+        # percorre poucas camadas – suficiente e barato
+        to_scan = [root] + list(root)[:10]
+        for el in to_scan:
+            # atributos do namespace padrão e prefixados
+            for k, v in el.attrib.items():
+                # nada aqui
+                _ = (k, v)
+            # ElementTree não expõe xmlns* em attrib; como fallback mantemos BASE_NS
+            # Alguns fornecedores embutem o namespace no próprio tag; extraímos por inspeção
+            if "}" in el.tag:
+                uri = el.tag.split("}")[0].strip("{")
+                lname = _local_name(el.tag)
+                if uri in self.NFSE_VARIANTS:
+                    ns["nfse"] = uri
+                elif uri == self.BASE_NS["nfe"]:
+                    ns["nfe"] = uri
+                elif uri == self.BASE_NS["cte"]:
+                    ns["cte"] = uri
+                elif uri == self.BASE_NS["mdfe"]:
+                    ns["mdfe"] = uri
+        return ns
+
+
+# --------------------------- Funções de entrada ---------------------------
+# Para usar na AWS Lambda sem criar objeto manualmente
+_parser_singleton: Optional[DocumentoFiscalParser] = None
+
+def handler(event, context):
+    global _parser_singleton
+    if _parser_singleton is None:
+        _parser_singleton = DocumentoFiscalParser()
+    return _parser_singleton.lambda_handler(event, context)

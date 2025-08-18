@@ -89,7 +89,7 @@ class SiegConfig:
 
     @staticmethod
     def from_env() -> "SiegConfig":
-        api_key = os.getenv("API_KEY")
+        api_key = os.getenv("SIEG_API_KEY")
         url_root = os.getenv("URL_BAIXAR_XMLS", "https://api.sieg.com")
         if not api_key:
             raise ValueError("API_KEY ausente do ambiente.")
