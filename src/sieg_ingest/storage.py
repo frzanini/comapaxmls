@@ -173,7 +173,7 @@ class S3Storage:
         if if_exists == "skip":
             try:
                 if self._exists(key):
-                    logger.info("Já existe, pulando: s3://%s/%s", self.cfg.bucket, key)
+                    logger.info("Já existe, pulando: s3://%s/%s", self.cfg.s3_bucket, key)
                     return True
             except ClientError as e:
                 # Se 403, ainda tentamos PUT (permissões podem diferir entre HEAD/PUT).
