@@ -39,8 +39,9 @@ def main() -> None:
         year=2025,
         month=8,
         incluir_eventos=False,
-        xml_types=[XmlType.NFE, XmlType.CTE, XmlType.NFCE, XmlType.CFE, XmlType.MDFE],
-        participante="ambos",
+        #xml_types=[XmlType.NFE, XmlType.CTE, XmlType.NFCE, XmlType.CFE, XmlType.MDFE],
+        xml_types=[XmlType.NFE],
+        participante="destinatario",
         incluir_dest_quando_emitente=True
     )  # Exemplo: baixar por CNPJ/ano/mês
         

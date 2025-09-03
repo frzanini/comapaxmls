@@ -18,12 +18,38 @@ class SiegIngestionService:
         self.api = SiegApi(cfg)
         self.batcher = BatchIterator(cfg, self.api)
         self.parser = XmlParserAdapter()
-        self.storage = S3Storage(cfg=cfg)
+        self.storage = S3Storage(cfg=cfg.s3)
 
     @staticmethod
-    def month_range(year:int, month:int, tz:timezone=timezone.utc)->Tuple[datetime,datetime]:
+    def month_range(
+        year: int,
+        month: int,
+        tz: timezone = timezone.utc,
+        limit_to_today: bool = False,
+    ) -> Tuple[datetime, datetime]:
+        """
+        Retorna (início, fim) do mês no fuso informado.
+        Se limit_to_today=True e (year, month) == mês atual no fuso, limita o fim a 23:59:59 do dia atual.
+        """
         start = datetime(year, month, 1, tzinfo=tz)
-        end = (datetime(year+1,1,1,tzinfo=tz) if month==12 else datetime(year,month+1,1,tzinfo=tz)) - timedelta(seconds=1)
+
+        # primeiro dia do próximo mês
+        next_month_start = (
+            datetime(year + 1, 1, 1, tzinfo=tz)
+            if month == 12
+            else datetime(year, month + 1, 1, tzinfo=tz)
+        )
+        end = next_month_start - timedelta(seconds=1)
+
+        if limit_to_today:
+            now = datetime.now(tz)
+            if now.year == year and now.month == month:
+                today_start = datetime(year, month, now.day, tzinfo=tz)
+                tomorrow_start = today_start + timedelta(days=1)
+                end_today = tomorrow_start - timedelta(seconds=1)
+                if end_today < end:
+                    end = end_today
+
         return start, end
 
     def _process_batch(self, batch: Sequence[str]) -> Tuple[int,int]:
@@ -94,7 +120,7 @@ class SiegIngestionService:
                                 xml_types: Iterable[XmlType]=(XmlType.NFE, XmlType.CTE, XmlType.NFCE, XmlType.CFE, XmlType.MDFE),
                                 participante: str="ambos", incluir_dest_quando_emitente: bool=False,
                                 tz=timezone.utc)->None:
-        ini, fim = self.month_range(year, month, tz)
+        ini, fim = self.month_range(year, month, tz, limit_to_today=True)
         self.download_por_participante(start_date=ini, end_date=fim,
             xml_types=tuple(xml_types), include_events=incluir_eventos, cnpj=cnpj,
             participante=participante, incluir_dest_quando_emitente=incluir_dest_quando_emitente)

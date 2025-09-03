@@ -46,10 +46,10 @@ class DFEIngestor:
       s3://<bucket>/documentos/<CNPJ_EMITENTE>/<AAAA>/<MM>/.../*.xml
 
     Estratégia:
-      1) Processa DF‑e **emitidos por clientes** (leitura da tabela bronze.empresas_clientes).
-      2) Processa DF‑e **emitidos por não‑clientes** (descobre <CNPJ> no 1º nível após 'documentos/').
+      1) Processa DF-e **emitidos por clientes** (leitura da tabela bronze.empresas_clientes).
+      2) Processa DF-e **emitidos por não-clientes** (descobre <CNPJ> no 1º nível após 'documentos/').
       - Filtro temporal por LastModified (janela relativa via S3_ONLY_LAST_HOURS ou intervalo START/END).
-      - GET+parse concorrente (I/O‑bound).
+      - GET+parse concorrente (I/O-bound).
       - Dedup em memória no lote + INSERT ... ON CONFLICT (idempotente).
       - COPY em tabelas temporárias **sem constraints** por desempenho e para suportar múltiplos eventos por chave.
     """
@@ -149,11 +149,11 @@ class DFEIngestor:
         for page in paginator.paginate(
             Bucket=self.bucket,
             Prefix=self.prefix_base,
-            Delimiter="/"             # <- crucial: retorna só 1º nível após prefix_base
+            Delimiter="/"
         ):
             for cp in page.get("CommonPrefixes", []):
-                pfx: str = cp.get("Prefix", "")         # ex.: 'documentos/32989568000173/'
-                token = pfx[len(self.prefix_base):].strip("/")  # '32989568000173'
+                pfx: str = cp.get("Prefix", "")
+                token = pfx[len(self.prefix_base):].strip("/")
                 token_digits = only_digits(token)
                 if is_cnpj_cpf(token_digits):
                     emitentes.append(token_digits)
@@ -334,7 +334,11 @@ class DFEIngestor:
                     continue
 
                 cnpj_emit = only_digits(data.get("cnpj_emitente") or data.get("cpf_emitente"))
-                cnpj_dest = only_digits(data.get("destinatario"))
+                # >>> ALTERAÇÃO AQUI: passa a considerar os novos campos do parser <<<
+                cnpj_dest = only_digits(
+                    data.get("cnpj_destinatario") or data.get("cpf_destinatario") or data.get("destinatario")
+                )
+                # <<< FIM DA ALTERAÇÃO >>>
                 s3_uri = data.get("_s3_uri")
                 tipo = (data.get("tipo_documento") or "").lower()
 
@@ -396,6 +400,47 @@ class DFEIngestor:
         logger.info("Iniciando ingestão pontual: cnpj=%s ano=%d mes=%02d prefix=%s", cnpj, ano, mes, prefix)
         return self._processar_por_prefixo(prefix, usar_filtros_tempo=False)
 
+    # ---------- NOVO: Modo mês/ano (todos os emitentes) ----------
+    def ingerir_mes_ano(self, ano: int, mes: int, *, incluir_nao_clientes: Optional[bool] = None) -> tuple[int, int]:
+        """
+        Ingestão de **todo um mês/ano** para todos os emitentes.
+        - Lê clientes (bronze.empresas_clientes)
+        - Opcionalmente inclui emitentes não-clientes descobertos no bucket (nível 1 após prefixo).
+        - Ignora filtros de tempo por LastModified (varredura completa do mês).
+        - Caminho: documentos/<cnpj>/<ano>/<mes>/
+
+        Retorna (total_docs, total_eventos).
+        """
+        if not (1 <= mes <= 12):
+            raise ValueError("Mês deve estar entre 1 e 12")
+
+        total_docs = total_eventos = 0
+
+        clientes = self._fetch_clientes()
+        emitentes: List[str] = list(clientes)
+        clientes_set = set(clientes)
+
+        use_non_clients = self.include_non_client_emitters if incluir_nao_clientes is None else incluir_nao_clientes
+        if use_non_clients:
+            bucket_emit = set(self._listar_emitentes_no_bucket())
+            emitentes.extend([c for c in bucket_emit if c not in clientes_set])
+
+        if not emitentes:
+            logger.info("Nenhum emitente encontrado para ingerir mês/ano %04d/%02d.", ano, mes)
+            return 0, 0
+
+        logger.info("Iniciando ingestão mês/ano %04d/%02d para %d emitente(s).", ano, mes, len(emitentes))
+
+        for cnpj in emitentes:
+            prefix = f"{self.prefix_base}{cnpj}/{ano}/{mes:02d}/"
+            d, e = self._processar_por_prefixo(prefix, usar_filtros_tempo=False)
+            total_docs += d
+            total_eventos += e
+            logger.info("[MÊS/ANO %04d/%02d | %s] docs=%d eventos=%d", ano, mes, cnpj, d, e)
+
+        logger.info("INGESTÃO %04d/%02d CONCLUÍDA -> docs=%d eventos=%d", ano, mes, total_docs, total_eventos)
+        return total_docs, total_eventos
+
     # ---------- Orquestração ----------
     def executar(self) -> None:
         total_docs = total_eventos = 0
@@ -409,16 +454,16 @@ class DFEIngestor:
                 total_docs += d; total_eventos += e
                 logger.info("[CLIENTE %s] Emitidos -> docs=%d eventos=%d", cnpj, d, e)
 
-            # 2) Emitidos por não‑clientes (descobre no 1º nível após 'documentos/')
+            # 2) Emitidos por não-clientes (descobre no 1º nível após 'documentos/')
             if self.include_non_client_emitters:
                 emitentes_bucket = set(self._listar_emitentes_no_bucket())
                 nao_clientes = [c for c in emitentes_bucket if c not in clientes_set]
-                logger.info("Emitentes não‑clientes a processar: %d", len(nao_clientes))
+                logger.info("Emitentes não-clientes a processar: %d", len(nao_clientes))
 
                 for cnpj in nao_clientes:
                     d, e = self._processar_emitidos_por_emitente(cnpj)
                     total_docs += d; total_eventos += e
-                    logger.info("[NAO‑CLIENTE %s] Emitidos -> docs=%d eventos=%d", cnpj, d, e)
+                    logger.info("[NAO-CLIENTE %s] Emitidos -> docs=%d eventos=%d", cnpj, d, e)
 
             logger.info("TOTAL inseridos: docs=%d | eventos=%d", total_docs, total_eventos)
 
@@ -447,18 +492,38 @@ def main():
         logger.info("Ingestão pontual concluída -> docs=%d eventos=%d", d, e)
         return
 
+    # NOVO: mês/ano para todos (sem CNPJ)
+    if args.ano and args.mes and not args.cnpj:
+        d, e = job.ingerir_mes_ano(args.ano, args.mes)
+        logger.info("Ingestão mês/ano (todos) concluída -> docs=%d eventos=%d", d, e)
+        return
+
+    # 34.228.897/0001-27 | 34228897000127 | FERRAGENS LDA
+    # 24.670.826/0001-26 | 24670826000126 | COMAPAR COMERCIO DE MAQUINAS E PECAS LTDA
+    # 08.959.064/0001-26 | 08959064000126 | J B RECICLAGEM LTDA
+    # 51.254.159/0001-73 | 51254159000173 | KARINA  PLASTICOS LTDA (Emitente contra J B Reciclagem)
+    # 14.739.053/0005-67 | 14739053000567 | K R L LOPES DE CASTRO E CIA LTDA (Emitente contra J B Reciclagem)
+
     # Prioridade 2: variáveis de ambiente (TARGET_CNPJ, TARGET_ANO, TARGET_MES)
-    env_cnpj = '24670826000126' ##os.getenv("TARGET_CNPJ")
-    env_ano = '2025' ##os.getenv("TARGET_ANO")
-    env_mes = '07' ##os.getenv("TARGET_MES")
+    #env_cnpj = '14739053000567'  # os.getenv("TARGET_CNPJ")
+    env_cnpj = None              # os.getenv("TARGET_CNPJ")
+    env_ano = '2025'             # os.getenv("TARGET_ANO")
+    env_mes = '08'               # os.getenv("TARGET_MES")
 
-    # if env_cnpj and env_ano and env_mes:
-    #     d, e = job.ingerir_emitente_ano_mes(env_cnpj, int(env_ano), int(env_mes))
-    #     logger.info("Ingestão pontual (ENV) concluída -> docs=%d eventos=%d", d, e)
-    #     return
+    if env_cnpj and env_ano and env_mes:
+        d, e = job.ingerir_emitente_ano_mes(env_cnpj, int(env_ano), int(env_mes))
+        logger.info("Ingestão pontual (ENV) concluída -> docs=%d eventos=%d", d, e)
+        return
 
-    # Fallback: fluxo completo (clientes + não clientes)
+    # (Opcional) mês/ano via ENV sem CNPJ
+    # Descomente as 3 linhas abaixo se quiser habilitar por ENV também:
+    if not env_cnpj and env_ano and env_mes:
+        d, e = job.ingerir_mes_ano(int(env_ano), int(env_mes))
+        logger.info("Ingestão mês/ano (ENV, todos) concluída -> docs=%d eventos=%d", d, e); return
+
+    # Fallback: fluxo completo (clientes + não clientes) com janelas de tempo
     job.executar()
 
 if __name__ == "__main__":
     main()
+# ===================== Fim =====================
