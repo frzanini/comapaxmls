@@ -508,7 +508,7 @@ def main():
     #env_cnpj = '14739053000567'  # os.getenv("TARGET_CNPJ")
     env_cnpj = None              # os.getenv("TARGET_CNPJ")
     env_ano = '2025'             # os.getenv("TARGET_ANO")
-    env_mes = '08'               # os.getenv("TARGET_MES")
+    env_mes = '09'               # os.getenv("TARGET_MES")
 
     # if env_cnpj and env_ano and env_mes:
     #     d, e = job.ingerir_emitente_ano_mes(env_cnpj, int(env_ano), int(env_mes))
