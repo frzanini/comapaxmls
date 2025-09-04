@@ -510,10 +510,10 @@ def main():
     env_ano = '2025'             # os.getenv("TARGET_ANO")
     env_mes = '08'               # os.getenv("TARGET_MES")
 
-    if env_cnpj and env_ano and env_mes:
-        d, e = job.ingerir_emitente_ano_mes(env_cnpj, int(env_ano), int(env_mes))
-        logger.info("Ingestão pontual (ENV) concluída -> docs=%d eventos=%d", d, e)
-        return
+    # if env_cnpj and env_ano and env_mes:
+    #     d, e = job.ingerir_emitente_ano_mes(env_cnpj, int(env_ano), int(env_mes))
+    #     logger.info("Ingestão pontual (ENV) concluída -> docs=%d eventos=%d", d, e)
+    #     return
 
     # (Opcional) mês/ano via ENV sem CNPJ
     # Descomente as 3 linhas abaixo se quiser habilitar por ENV também:
