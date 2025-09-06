@@ -1,8 +1,8 @@
 from __future__ import annotations
 import xml.etree.ElementTree as ET
-from dfe.types import ParseOut
-from dfe.base import collect_ns
-from dfe.utils import text_or_none, only_digits, norm_dt
+from DFeNew.types import ParseOut
+from DFeNew.base import collect_ns
+from DFeNew.utils import text_or_none, only_digits, norm_dt
 
 def parse_evento(root: ET.Element) -> ParseOut:
     ns = {"nfe": collect_ns(root)["nfe"]}

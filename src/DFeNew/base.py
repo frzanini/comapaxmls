@@ -1,8 +1,8 @@
 from __future__ import annotations
 from typing import Dict
 import xml.etree.ElementTree as ET
-from dfe.logger import get_logger
-from dfe.utils import ns_uri
+from DFeNew.logger import get_logger
+from DFeNew.utils import ns_uri
 
 logger = get_logger(__name__)
 

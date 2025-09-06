@@ -2,16 +2,16 @@ from __future__ import annotations
 from typing import Dict, Any
 import xml.etree.ElementTree as ET
 
-from dfe.logger import get_logger
-from dfe.utils import local_name
-from dfe.types import ParseOut
-from dfe.nfe_cte_mdfe import parse_nfe_cte_mdfe
-from dfe.evento import parse_evento
-from dfe.nfse import parse_nfse, looks_like_nfse
+from DFeNew.logger import get_logger
+from DFeNew.utils import local_name
+from DFeNew.types import ParseOut
+from DFeNew.nfe_cte_mdfe import parse_nfe_cte_mdfe
+from DFeNew.evento import parse_evento
+from DFeNew.nfse import parse_nfse, looks_like_nfse
 
 log = get_logger(__name__)
 
-class DFe:
+class DFeNew:
     """
     Fachada estável p/ DF-e.
     Mantém compatibilidade com o retorno da sua classe original (dict).

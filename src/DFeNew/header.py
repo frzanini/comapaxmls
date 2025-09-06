@@ -1,8 +1,8 @@
 from __future__ import annotations
 import re, xml.etree.ElementTree as ET
 from typing import Optional, Dict
-from dfe.base import collect_ns
-from dfe.utils import text_or_none, only_digits, norm_dt
+from DFeNew.base import collect_ns
+from DFeNew.utils import text_or_none, only_digits, norm_dt
 
 class HeaderExtractor:
     """
@@ -77,7 +77,7 @@ class HeaderExtractor:
         }
 
     def nfse(self, root: ET.Element) -> Dict[str, Optional[str]]:
-        from dfe.nfse import looks_like_nfse
+        from DFeNew.nfse import looks_like_nfse
         ns = collect_ns(root)
         if not looks_like_nfse(root):
             return {}

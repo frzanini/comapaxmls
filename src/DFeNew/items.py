@@ -3,8 +3,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Dict
-from dfe.base import collect_ns
-from dfe.utils import text_or_none
+from DFeNew.base import collect_ns
+from DFeNew.utils import text_or_none
 
 _DEC = Decimal
 

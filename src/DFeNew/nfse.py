@@ -1,8 +1,8 @@
 from __future__ import annotations
 import xml.etree.ElementTree as ET
-from dfe.types import ParseOut
-from dfe.base import collect_ns, NFSE_VARIANTS
-from dfe.utils import text_or_none, only_digits, norm_dt
+from DFeNew.types import ParseOut
+from DFeNew.base import collect_ns, NFSE_VARIANTS
+from DFeNew.utils import text_or_none, only_digits, norm_dt
 
 def looks_like_nfse(root: ET.Element) -> bool:
     tag = root.tag.split("}")[-1].lower() if "}" in root.tag else root.tag.lower()
