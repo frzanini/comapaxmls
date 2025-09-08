@@ -3,47 +3,170 @@ from decimal import Decimal as D
 from typing import Dict, Any, List, Tuple
 from domain import NFeNota, NFeItem
 
-# --- Anexo 07 (C170) ---
+
+
 def map_item_to_c170(nota: NFeNota, item: NFeItem, tipo_mov: str) -> Dict[str, Any]:
-    return {
-        "num_item_nf": item.n_item,
-        "cod_prod": item.c_prod,
-        "tipo_mov": tipo_mov,  # "E"/"S"
-        "cnpj_cpf_cliente": nota.cnpj_dest or nota.cnpj_emit,
-        "ie_cliente": 0,
-        "num_nf": int(nota.numero or 0),
-        "data_nf": nota.data_emissao,
-        "uf_nf": nota.uf_emit,
-        "serie_nf": nota.serie or "1",
-        "especie_nf": "NF",
-        "modelo_nf": int(nota.modelo or 55),
-        "qtd_total_item": item.q_com,
-        "valor_total_item": item.v_prod,
-        "aliq_icms": item.p_icms,
-        "valor_ipi": item.v_ipi,
-        "bc_icms": item.v_bc_icms,
-        "bc_st": item.v_bc_st,
-        "valor_desc": Decimal("0"),
-        "cfop": item.cfop,
-        "cst_icms": item.cst_icms,
-        "mov_fisica": True,
-        "cst_cofins": 1,
-        "cst_pis": 1,
-        "cst_ipi": 1,
-        "aliq_ipi": item.p_ipi,
-        "bc_ipi": Decimal("0"),
-        "aliq_pis": item.p_pis,
-        "bc_pis": Decimal("0"),
-        "valor_pis": item.v_pis,
-        "aliq_cofins": item.p_cofins,
-        "bc_cofins": Decimal("0"),
-        "valor_cofins": item.v_cofins,
-        "valor_icms": item.v_icms,
-        "aliq_st": item.p_icms_st,
-        "valor_st": item.v_icms_st,
+    """
+    Mapeia um item de NF-e para o layout C170 (Anexo 07).
+    Retorna dict com as chaves exatamente iguais às do layout SCI.
+    """
+    is_saida = (str(tipo_mov or "S").upper() == "S")
+    cnpj_cli = (nota.cnpj_dest if is_saida else nota.cnpj_emit) or ""
+    ie_cli   = (nota.ie_dest if is_saida else getattr(nota, "ie_emit", "")) or ""
+
+    # Helpers
+    def nz(v, casas=2):
+        try:
+            return round(D(str(v or "0")), casas)
+        except Exception:
+            return D("0")
+
+    row: Dict[str, Any] = {
+        # 01–20 núcleo
+        "num_item_nf":      int(getattr(item, "n_item", 1)),
+        "c_prod":           getattr(item, "c_prod", ""),
+        "tipo_mov":         ("S" if is_saida else "E"),
+        "cnpj_cpf_cliente": cnpj_cli,
+        "ie_cliente":       ie_cli,
+        "num_nf":           int(nota.numero or 0),
+        "data_nf":          nota.data_emissao or "",
+        "uf_nf":            nota.uf_emit or "",
+        "serie_nf":         nota.serie or "",
+        "especie_nf":       nota.especie or "NFF",
+        "modelo_nf":        nota.modelo or "55",
+        "qtd_produto":      nz(item.q_com),
+        "vl_total_produto": nz(item.v_prod),
+        "aliq_icms":        nz(item.p_icms),
+        "vl_ipi":           nz(item.v_ipi),
+        "bc_icms":          nz(item.v_bc_icms),
+        "bc_st":            nz(item.v_bc_st),
+        "vl_desconto":      nz(getattr(item, "v_desc", 0)),
+        "nat_oper":         item.cfop or "",
+        "cst_icms":         item.cst_icms or "",
+
+        # 21–36 SPED
+        "mov_fisica":       "S",  # default Sim
+        "cst_cofins":       getattr(item, "cst_cofins", "01"),
+        "cst_pis":          getattr(item, "cst_pis", "01"),
+        "cst_ipi":          getattr(item, "cst_ipi", "01"),
+        "aliq_ipi":         nz(item.p_ipi),
+        "bc_ipi":           nz(getattr(item, "v_bc_ipi", 0)),
+        "aliq_pis":         nz(item.p_pis),
+        "bc_pis":           nz(getattr(item, "v_bc_pis", 0)),
+        "vl_pis":           nz(item.v_pis),
+        "aliq_cofins":      nz(item.p_cofins),
+        "bc_cofins":        nz(getattr(item, "v_bc_cofins", 0)),
+        "vl_cofins":        nz(item.v_cofins),
+        "vl_icms":          nz(item.v_icms),
+        "aliq_st":          nz(getattr(item, "aliq_st_sped", 0)),
+        "vl_st":            nz(item.v_icms_st),
+        "conta_analitica":  getattr(item, "conta_analitica_sped", ""),
+        "aliq_issqn":       D("0.00"),
+        "bc_issqn":         D("0.00"),
+        "vl_issqn":         D("0.00"),
+
+        # 40–50 logística/ST retenção
+        "classif_item":     getattr(item, "classif_item", 0),
+        "tipo_receita":     getattr(item, "tipo_receita", 0),
+        "desp_acessorias":  nz(getattr(item, "despesas_acessorias", 0)),
+        "mun_origem":       getattr(item, "mun_origem", "00000"),
+        "mun_destino":      getattr(item, "mun_destino", "00000"),
+        "placa":            getattr(nota, "placa1", ""),
+        "uf_placa":         getattr(nota, "uf_placa1", ""),
+        "icms_st_repassar": nz(getattr(item, "icms_st_deduzir", 0)),
+        "icms_st_completar":nz(getattr(item, "icms_st_completar", 0)),
+        "bc_retencao":      nz(getattr(item, "base_retencao", 0)),
+        "parcela_retida":   nz(getattr(item, "parcela_imposto_retido", 0)),
+
+        # 51–65 (incentivo, DI, conversões etc.)
+        "incentivo_fiscal": "N",
+        "base_icms_dif_peso": D("0.00"),
+        "dif_peso":         D("0.00"),
+        "red_base_calc":    D("0.00"),
+        "num_di":           "",
+        "un_med_mov":       getattr(item, "u_com", ""),
+        "cod_selo_ipi":     "",
+        "qtd_selo_ipi":     0,
+        "classe_ipi_un":    "",
+        "vl_unit_un_padrao": nz(item.v_un_com),
+        "qtd_total_un_padrao": nz(item.q_com),
+        "cst_simples":      "",
+        "cod_apur_pis_cofins": "",
+        "saida_incent_prodepe": "N",
+        "perc_prodepe":     D("0.00"),
+
+        # 66–133 (frete, FCP, efetivo, originais, conversões etc.)
+        "vl_frete":         nz(getattr(item, "v_frete", 0)),
+        "vl_seguro":        nz(getattr(item, "v_seg", 0)),
+        "bc_fcpst":         nz(getattr(item, "base_fcp_st", 0)),
+        "aliq_fcpst":       nz(getattr(item, "p_fcp_st", 0)),
+        "vl_fcpst":         nz(getattr(item, "v_fcp_st", 0)),
+        "retorno_ipi":      D("0.00"),
+        "bc_fcp_icms":      nz(getattr(item, "base_fcp", 0)),
+        "aliq_fcp_icms":    nz(getattr(item, "p_fcp", 0)),
+        "vl_fcp_icms":      nz(getattr(item, "v_fcp", 0)),
+        "vl_icms_desonerado": D("0.00"),
+        "bc_icms_st_ret_ant": D("0.00"),
+        "aliq_icms_st_ret_ant": D("0.00"),
+        "vl_icms_st_ret_ant": D("0.00"),
+        "bc_fcp_st_ret_ant": D("0.00"),
+        "aliq_fcp_st_ret_ant": D("0.00"),
+        "vl_fcp_st_ret_ant": D("0.00"),
+        "bc_icms_efetivo":  D("0.00"),
+        "aliq_icms_efetivo": D("0.00"),
+        "vl_icms_efetivo":  D("0.00"),
+        "red_icms_efetivo": D("0.00"),
+        "bc_icms_st_original": D("0.00"),
+        "aliq_icms_st_original": D("0.00"),
+        "vl_icms_st_original": D("0.00"),
+        "bc_fcp_st_original": D("0.00"),
+        "aliq_fcp_st_original": D("0.00"),
+        "vl_fcp_st_original": D("0.00"),
+        "aliq_funrural":    D("0.00"),
+        "vl_funrural":      D("0.00"),
+        "icms_funrural":    D("0.00"),
+        "tipo_funrural":    0,
+        "vl_mvasn":         D("0.00"),
+        "cod_item_giaf":    "",
+        "vl_diff_base_cred_pres": D("0.00"),
+        "vl_cred_presumido":D("0.00"),
+        "incent_transporte": "N",
+        "base_cred_presumido_imp": "N",
+        "saida_entrada_incent": "N",
+        "base_ipi_original": D("0.00"),
+        "aliq_ipi_original": D("0.00"),
+        "vl_ipi_original":  D("0.00"),
+        "resp_retencao":    0,
+        "qtd_convertida":   D("0.00"),
+        "un_convertida":    "",
+        "vl_unit_convertido": D("0.00"),
+        "cred_icms_unit_conv": D("0.00"),
+        "base_st_unit_conv": D("0.00"),
+        "icms_fcp_st_unit_conv": D("0.00"),
+        "fcp_st_unit_conv": D("0.00"),
+        "modelo_arrecadacao": 0,
+        "num_doc_arrecadacao": "",
+        "afrmm":            D("0.00"),
+        "aliq_cred_sn":     D("0.00"),
+        "cst_icms_original": "",
+        "cfop_original":   "",
+        "base_icms_cred_sn": D("0.00"),
+        "aliq_icms_cred_sn": D("0.00"),
+        "vl_icms_cred_sn": D("0.00"),
+        "base_icms_original": D("0.00"),
+        "aliq_icms_original": D("0.00"),
+        "vl_icms_original": D("0.00"),
+        "base_fcp_original": D("0.00"),
+        "aliq_fcp_original": D("0.00"),
+        "vl_fcp_original": D("0.00"),
+        "origem_mercadoria": 0,
+        "modalidade_bc_st": "",
+        "modalidade_bc_st_orig": "",
+        "devolucao_valor_item": "N",
+        "vl_st_substituido": D("0.00"),
     }
 
-
+    return row
 
 # --- Anexo 09 (Entradas) ---
 # --- helper: agrupa até 5 faixas de ICMS por alíquota ---

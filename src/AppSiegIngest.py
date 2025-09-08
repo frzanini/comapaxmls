@@ -25,7 +25,7 @@ def main() -> None:
     logging.info("Iniciando ingestão de teste...")
     
     service.baixar_intervalo_dias(
-        days_back=5,
+        days_back=6,
         xml_types=[XmlType.NFE],
         include_events=False,
         #cnpj="24670826000126",
