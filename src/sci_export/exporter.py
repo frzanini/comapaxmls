@@ -26,16 +26,23 @@ class SciExporter:
     def _rows_anexo07(self, notas: List[NFeNota], who_cnpj: str):
         rows = []
         for n in notas:
-            tipo_mov = "E" if n.cnpj_dest == who_cnpj else "S"
+            # normaliza antes de comparar
+            dest = only_digits(n.cnpj_dest or "")
+            tipo_mov = "E" if dest == who_cnpj else "S"
             for it in n.items or []:
                 rows.append(map_item_to_c170(n, it, tipo_mov))
         return rows
 
-    def _rows_anexo09(self, notas: List[NFeNota]):
-        return [map_nota_to_entradas(n, i + 1) for i, n in enumerate(notas)]
+    def _rows_anexo09(self, notas: List[NFeNota], who_cnpj: str):
+        # ENTRADAS: somente notas cujo destinatário == who_cnpj
+        filtradas = [n for n in notas if only_digits(n.cnpj_dest or "") == who_cnpj]
+        return [map_nota_to_entradas(n, i + 1) for i, n in enumerate(filtradas)]
 
-    def _rows_anexo04(self, notas: List[NFeNota]):
-        return [map_nota_to_saidas(n, i + 1) for i, n in enumerate(notas)]
+    def _rows_anexo04(self, notas: List[NFeNota], who_cnpj: str):
+        # SAÍDAS: somente notas cujo emitente == who_cnpj
+        filtradas = [n for n in notas if only_digits(n.cnpj_emit or "") == who_cnpj]
+        return [map_nota_to_saidas(n, i + 1) for i, n in enumerate(filtradas)]
+
 
     def generate(self, cnpj: str, inicio: date, fim: date, papel: str, anexos: Sequence[str]) -> None:
         rows_db = self._db.list_s3_uris(cnpj, inicio, fim, papel)
@@ -51,9 +58,9 @@ class SciExporter:
         if "07" in anexos:
             Formatter.write_rows(base / "anexo07_c170.txt", ANEXO07_C170, self._rows_anexo07(notas, who_cnpj=only_digits(cnpj)))
         if "09" in anexos:
-            Formatter.write_rows(base / "anexo09_entradas.txt", ANEXO09_ENTRADAS, self._rows_anexo09(notas))
+            Formatter.write_rows(base / "anexo09_entradas.txt", ANEXO09_ENTRADAS, self._rows_anexo09(notas, who_cnpj=only_digits(cnpj)))
         if "04" in anexos:
-            Formatter.write_rows(base / "anexo04_saidas.txt", ANEXO04_SAIDAS, self._rows_anexo04(notas))
+            Formatter.write_rows(base / "anexo04_saidas.txt", ANEXO04_SAIDAS, self._rows_anexo04(notas, who_cnpj=only_digits(cnpj)))
 
 # helper local
 from utils import only_digits

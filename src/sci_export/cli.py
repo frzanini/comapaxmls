@@ -20,14 +20,15 @@ def main(argv=None):
     # args = ap.parse_args(argv)
 
     cnpj = "08959064000126"
-    inicio = "2025-08-01"
-    fim = "2025-08-31"
+    inicio = "2025-08-12"
+    fim = "2025-08-25"
     papel = "ambos"
     #anexo 04 --anexo 07 --anexo 09
 
     st = Settings()
     #anexos = set(args.anexo or ["04", "07", "09"])  # todos por padrão
-    anexos = set(["04", "07", "09"])  # todos por padrão
+    #anexos = set(["04", "07", "09"])  # todos por padrão
+    anexos = set(["04","09"]) 
 
     exp = SciExporter(st)
     try:

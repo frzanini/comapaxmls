@@ -61,5 +61,6 @@ nosetests.xml
 .DS_Store
 Thumbs.db
 
+out_sci/*
 temp/*
 !temp/.gitkeep
