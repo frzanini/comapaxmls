@@ -472,6 +472,15 @@ class DFEIngestor:
 
 # ===================== Entrypoint =====================
 def main():
+    """
+    Função principal para ingestão de Documentos Fiscais Eletrônicos (DF-e) via S3.
+    Esta função permite a execução do processo de ingestão de DF-e de diferentes formas:
+    1. Por meio de parâmetros de linha de comando (CNPJ, ano e mês), realiza a ingestão pontual de um emitente específico.
+    2. Caso apenas ano e mês sejam informados, realiza a ingestão de todos os emitentes para o período especificado.
+    3. Alternativamente, permite a configuração dos parâmetros via variáveis de ambiente (TARGET_CNPJ, TARGET_ANO, TARGET_MES).
+    4. Se nenhum parâmetro for informado, executa o fluxo completo de ingestão, abrangendo clientes e não clientes em janelas de tempo.
+    O objetivo é flexibilizar o processo de ingestão, permitindo execuções pontuais, por período ou completas, conforme a necessidade.
+    """
 
     # Opcional: silenciar console mas manter arquivo (LOG_SILENT=1 já faz isso globalmente)
     logging.getLogger().handlers[0].setLevel(logging.CRITICAL)

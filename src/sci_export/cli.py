@@ -10,18 +10,18 @@ def _parse_date(s: str):
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-"""
-Ponto de entrada principal para a ferramenta de linha de comando de exportação SCI TXT.
-Esta função configura os parâmetros necessários para exportar dados SCI, incluindo CNPJ, intervalo de datas, tipo de papel e anexos a serem gerados.
-Inicializa as configurações da aplicação e o exportador, então executa o processo de exportação usando os parâmetros fornecidos.
-O processo de exportação envolve gerar arquivos TXT a partir do banco de dados, opcionalmente enviar para o S3, realizar o parsing e finalizar a exportação.
-Todos os recursos são devidamente fechados após a execução.
-Args:
-    argv (list[str], opcional): Argumentos de linha de comando. Se None, utiliza parâmetros padrão para teste.
-Exceções:
-    Quaisquer exceções levantadas durante o processo de exportação são propagadas após a limpeza dos recursos.
-"""
 def main(argv=None):
+    """
+    Ponto de entrada principal para a ferramenta de linha de comando de exportação SCI TXT.
+    Esta função configura os parâmetros necessários para exportar dados SCI, incluindo CNPJ, intervalo de datas, tipo de papel e anexos a serem gerados.
+    Inicializa as configurações da aplicação e o exportador, então executa o processo de exportação usando os parâmetros fornecidos.
+    O processo de exportação envolve gerar arquivos TXT a partir do banco de dados, opcionalmente enviar para o S3, realizar o parsing e finalizar a exportação.
+    Todos os recursos são devidamente fechados após a execução.
+    Args:
+        argv (list[str], opcional): Argumentos de linha de comando. Se None, utiliza parâmetros padrão para teste.
+    Exceções:
+        Quaisquer exceções levantadas durante o processo de exportação são propagadas após a limpeza dos recursos.
+    """
     # ap = argparse.ArgumentParser(description="SCI TXT Export — DB→S3→Parser→TXT")
     # ap.add_argument("--cnpj", required=True, help="CNPJ alvo (emitente/destinatário)")
     # ap.add_argument("--inicio", required=True, help="Data início (YYYY-MM-DD)")
